@@ -1,0 +1,94 @@
+name: Build Hidden Settings
+
+# Works with a project .zip in the repo root (or with loose project files).
+# Runs on every push to main, or by hand from the Actions tab.
+# Output: HiddenSettings.apk + HiddenSettings-Magisk-module.zip on the Releases page.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find the project (unpack the zip if needed)
+        run: |
+          if [ -f settings.gradle.kts ]; then
+            ROOT=.
+          else
+            ZIP=$(ls -1 *.zip 2>/dev/null | head -1 || true)
+            if [ -z "$ZIP" ]; then
+              echo "No settings.gradle.kts and no .zip in the repo root."; exit 1
+            fi
+            echo "Unpacking $ZIP"
+            mkdir -p _project
+            unzip -q -o "$ZIP" -d _project
+            FOUND=$(find _project -name settings.gradle.kts | head -1)
+            if [ -z "$FOUND" ]; then
+              echo "The zip has no settings.gradle.kts inside."; exit 1
+            fi
+            ROOT=$(dirname "$FOUND")
+          fi
+          ROOT=$(realpath "$ROOT")
+          echo "Project root: $ROOT"
+          if [ ! -f "$ROOT/keystore/hidden.jks" ]; then
+            echo "Missing keystore/hidden.jks in the project."; exit 1
+          fi
+          echo "ROOT=$ROOT" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Accept Android SDK licenses
+        run: |
+          SDKM=$(ls "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | head -1)
+          echo "Using $SDKM"
+          yes | "$SDKM" --licenses > /dev/null || true
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.10.2
+
+      - name: Build APK
+        working-directory: ${{ env.ROOT }}
+        run: gradle --no-daemon --stacktrace :app:assembleDebug
+
+      - name: Package APK and Magisk module
+        run: |
+          set -e
+          APK="$ROOT/app/build/outputs/apk/debug/app-debug.apk"
+          mkdir -p dist module/system/app/HiddenSettings
+          cp -r "$ROOT"/magisk/. module/
+          cp "$APK" module/system/app/HiddenSettings/HiddenSettings.apk
+          (cd module && zip -r9 ../dist/HiddenSettings-Magisk-module.zip .)
+          cp "$APK" dist/HiddenSettings.apk
+          ls -la dist
+
+      - name: Upload build files
+        uses: actions/upload-artifact@v4
+        with:
+          name: HiddenSettings
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Build ${{ github.run_number }}
+          prerelease: true
+          files: dist/*
